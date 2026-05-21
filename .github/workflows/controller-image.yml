@@ -1,0 +1,111 @@
+name: Controller Image (UBC)
+
+# UBC-specific workflow: builds the ingress-nginx controller container images
+# (standard + chroot) on `controller-v*` tag pushes and publishes them to
+# GitHub Container Registry under `ghcr.io/ubc/ingress-nginx/`.
+#
+# Mirrors upstream's `make release` flow (see cloudbuild.yaml) which runs the
+# Go cross-compile inside the golang build container, then uses buildx to
+# assemble and push multi-arch images.
+
+on:
+  push:
+    tags:
+      - 'controller-v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (tag, branch, or SHA). Required.'
+        required: true
+        type: string
+      tag:
+        description: 'Image tag to publish (e.g. v1.15.5). Defaults to ref with controller- prefix stripped.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io/ubc/ingress-nginx
+  BUILDX_PLATFORMS: linux/amd64,linux/arm64
+  PLATFORMS: amd64 arm64
+
+jobs:
+  release:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve ref and image tag
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            REF='${{ inputs.ref }}'
+            TAG='${{ inputs.tag }}'
+            if [ -z "$TAG" ]; then
+              TAG="${REF#controller-}"
+            fi
+          else
+            REF="${GITHUB_REF_NAME}"
+            TAG="${GITHUB_REF_NAME#controller-}"
+          fi
+          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Building ref=${REF} as image tag=${TAG}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Override TAG file with image tag
+        run: echo -n "${{ steps.resolve.outputs.tag }}" > TAG
+
+      - name: Get Go version
+        id: go
+        run: echo "version=$(cat GOLANG_VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.go.outputs.version }}
+          check-latest: true
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: latest
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push controller images
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          BUILDX_PLATFORMS: ${{ env.BUILDX_PLATFORMS }}
+          PLATFORMS: ${{ env.PLATFORMS }}
+          COMMIT_SHA: ${{ github.sha }}
+          BUILD_ID: ${{ github.run_id }}
+          REPO_INFO: https://github.com/${{ github.repository }}
+        run: make release
+
+      - name: Summary
+        run: |
+          {
+            echo "## Pushed images"
+            echo ""
+            echo '```'
+            echo "${REGISTRY}/controller:${{ steps.resolve.outputs.tag }}"
+            echo "${REGISTRY}/controller-chroot:${{ steps.resolve.outputs.tag }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -88,10 +88,44 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The controller image is FROM the nginx base image. NGINX_BASE points at
+      # upstream's prebuilt base, which does NOT carry this fork's
+      # images/nginx/rootfs/patches/ stack (the nginx source CVE backports). We
+      # must build the base from source here and pass it to `make release` as
+      # BASE_IMAGE, or the shipped controller runs unpatched nginx.
+      - name: Build and push patched nginx base
+        id: base
+        env:
+          # images/nginx/Makefile: IMAGE=$(REGISTRY)/nginx, TAG=$(cat TAG)
+          REGISTRY: ${{ env.REGISTRY }}
+          PLATFORMS: ${{ env.BUILDX_PLATFORMS }}
+        run: |
+          BASE_TAG="$(cat images/nginx/TAG)"
+          make -C images/nginx push REGISTRY="${REGISTRY}" PLATFORMS="${PLATFORMS}"
+          BASE_REPO="${REGISTRY}/nginx"
+          DIGEST="$(docker buildx imagetools inspect "${BASE_REPO}:${BASE_TAG}" --format '{{.Manifest.Digest}}')"
+          echo "image=${BASE_REPO}:${BASE_TAG}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Built patched nginx base: ${BASE_REPO}:${BASE_TAG}@${DIGEST}"
+
+      # Fail the release if the base somehow lacks the patch stack. `max_headers`
+      # is an nginx directive that exists only with patch 37 (CVE-2026-49975),
+      # so an unpatched base rejects it with "unknown directive".
+      - name: Verify the base carries the patch stack
+        run: |
+          OUT="$(docker run --rm --platform linux/amd64 "${{ steps.base.outputs.image }}" \
+            sh -c 'printf "events{}\nhttp{ max_headers 10; }\n" > /tmp/t.conf; nginx -c /tmp/t.conf -t 2>&1' || true)"
+          echo "$OUT"
+          if echo "$OUT" | grep -q 'unknown directive "max_headers"'; then
+            echo "::error::nginx base image is UNPATCHED (max_headers missing) — the patch stack did not build into it."
+            exit 1
+          fi
+          echo "Base image carries the patch stack (max_headers recognized)."
+
       - name: Build and push controller images
         env:
           REGISTRY: ${{ env.REGISTRY }}
           TAG: ${{ steps.resolve.outputs.tag }}
+          BASE_IMAGE: ${{ steps.base.outputs.image }}
           BUILDX_PLATFORMS: ${{ env.BUILDX_PLATFORMS }}
           PLATFORMS: ${{ env.PLATFORMS }}
           COMMIT_SHA: ${{ github.sha }}

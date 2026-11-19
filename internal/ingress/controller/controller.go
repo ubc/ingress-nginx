@@ -47,6 +47,7 @@ import (
 	"k8s.io/ingress-nginx/internal/ingress/inspector"
 	"k8s.io/ingress-nginx/internal/ingress/metric/collectors"
 	"k8s.io/ingress-nginx/internal/k8s"
+	ing_net "k8s.io/ingress-nginx/internal/net"
 	"k8s.io/ingress-nginx/internal/nginx"
 	"k8s.io/ingress-nginx/pkg/apis/ingress"
 	utilingress "k8s.io/ingress-nginx/pkg/util/ingress"
@@ -349,12 +350,12 @@ func (n *NGINXController) CheckIngress(ing *networking.Ingress) error {
 
 	// Do not attempt to validate an ingress that's not meant to be controlled by the current instance of the controller.
 	if ingressClass, err := n.store.GetIngressClass(ing, n.cfg.IngressClassConfiguration); ingressClass == "" {
-		klog.Warningf("ignoring ingress %v in %v based on annotation %v: %v", ing.Name, ing.ObjectMeta.Namespace, ingressClass, err)
+		klog.Warningf("ignoring ingress %q in %q based on annotation %v: %v", ing.Name, ing.Namespace, ingressClass, err)
 		return nil
 	}
 
 	if n.cfg.Namespace != "" && ing.ObjectMeta.Namespace != n.cfg.Namespace {
-		klog.Warningf("ignoring ingress %v in namespace %v different from the namespace watched %s", ing.Name, ing.ObjectMeta.Namespace, n.cfg.Namespace)
+		klog.Warningf("ignoring ingress %q in namespace %q different from the namespace watched %s", ing.Name, ing.Namespace, n.cfg.Namespace)
 		return nil
 	}
 
@@ -535,8 +536,11 @@ func (n *NGINXController) getStreamServices(configmapName string, proto apiv1.Pr
 			continue
 		}
 		var endps []ingress.Endpoint
-		/* #nosec */
-		targetPort, err := strconv.Atoi(svcPort) // #nosec
+		targetPort, isPortNumber, validPort := ing_net.ParsePort(svcPort)
+		if isPortNumber && !validPort {
+			klog.Warningf("%q is not a valid %v port number for Service %q", svcPort, proto, nsName)
+			continue
+		}
 		var zone string
 		if n.cfg.EnableTopologyAwareRouting {
 			zone = getIngressPodZone(svc)
@@ -544,7 +548,7 @@ func (n *NGINXController) getStreamServices(configmapName string, proto apiv1.Pr
 			zone = emptyZone
 		}
 
-		if err != nil {
+		if !isPortNumber {
 			// not a port number, fall back to using port name
 			klog.V(3).Infof("Searching Endpoints with %v port name %q for Service %q", proto, svcPort, nsName)
 			for i := range svc.Spec.Ports {
@@ -560,8 +564,7 @@ func (n *NGINXController) getStreamServices(configmapName string, proto apiv1.Pr
 			klog.V(3).Infof("Searching Endpoints with %v port number %d for Service %q", proto, targetPort, nsName)
 			for i := range svc.Spec.Ports {
 				sp := svc.Spec.Ports[i]
-				//nolint:gosec // Ignore G109 error
-				if sp.Port == int32(targetPort) {
+				if sp.Port == targetPort {
 					if sp.Protocol == proto {
 						endps = getEndpointsFromSlices(svc, &sp, proto, zone, n.store.GetServiceEndpointsSlices)
 						break
@@ -1582,14 +1585,14 @@ func canMergeBackend(primary, alternative *ingress.Backend) bool {
 // Performs the merge action and checks to ensure that one two alternative backends do not merge into each other
 func mergeAlternativeBackend(ing *ingress.Ingress, priUps, altUps *ingress.Backend) bool {
 	if priUps.NoServer {
-		klog.Warningf("unable to merge alternative backend %v into primary backend %v because %v is a primary backend",
+		klog.Warningf("unable to merge alternative backend %q into primary backend %q because %q is a primary backend",
 			altUps.Name, priUps.Name, priUps.Name)
 		return false
 	}
 
 	for _, ab := range priUps.AlternativeBackends {
 		if ab == altUps.Name {
-			klog.V(2).Infof("skip merge alternative backend %v into %v, it's already present", altUps.Name, priUps.Name)
+			klog.V(2).Infof("skip merge alternative backend %q into %q, it's already present", altUps.Name, priUps.Name)
 			return true
 		}
 	}
@@ -1617,7 +1620,7 @@ func mergeAlternativeBackends(ing *ingress.Ingress, upstreams map[string]*ingres
 		altUps := upstreams[upsName]
 
 		if altUps == nil {
-			klog.Warningf("alternative backend %s has already been removed", upsName)
+			klog.Warningf("alternative backend %q has already been removed", upsName)
 		} else {
 			merged := false
 			altEqualsPri := false
@@ -1625,18 +1628,18 @@ func mergeAlternativeBackends(ing *ingress.Ingress, upstreams map[string]*ingres
 			for _, loc := range servers[defServerName].Locations {
 				priUps, ok := upstreams[loc.Backend]
 				if !ok {
-					klog.Warningf("cannot find primary backend %s for location %s%s", loc.Backend, servers[defServerName].Hostname, loc.Path)
+					klog.Warningf("cannot find primary backend %q for location %q", loc.Backend, servers[defServerName].Hostname+loc.Path)
 					continue
 				}
 				altEqualsPri = altUps.Name == priUps.Name
 				if altEqualsPri {
-					klog.Warningf("alternative upstream %s in Ingress %s/%s is primary upstream in Other Ingress for location %s%s!",
-						altUps.Name, ing.Namespace, ing.Name, servers[defServerName].Hostname, loc.Path)
+					klog.Warningf("alternative upstream %q in Ingress %q is primary upstream in Other Ingress for location %q!",
+						altUps.Name, k8s.MetaNamespaceKey(ing), servers[defServerName].Hostname+loc.Path)
 					break
 				}
 
 				if canMergeBackend(priUps, altUps) {
-					klog.V(2).Infof("matching backend %v found for alternative backend %v",
+					klog.V(2).Infof("matching backend %q found for alternative backend %q",
 						priUps.Name, altUps.Name)
 
 					merged = mergeAlternativeBackend(ing, priUps, altUps)
@@ -1644,7 +1647,7 @@ func mergeAlternativeBackends(ing *ingress.Ingress, upstreams map[string]*ingres
 			}
 
 			if !altEqualsPri && !merged {
-				klog.Warningf("unable to find real backend for alternative backend %v. Deleting.", altUps.Name)
+				klog.Warningf("unable to find real backend for alternative backend %q. Deleting.", altUps.Name)
 				delete(upstreams, altUps.Name)
 			}
 		}
@@ -1668,7 +1671,7 @@ func mergeAlternativeBackends(ing *ingress.Ingress, upstreams map[string]*ingres
 			altUps := upstreams[upsName]
 
 			if altUps == nil {
-				klog.Warningf("alternative backend %s has already been removed", upsName)
+				klog.Warningf("alternative backend %q has already been removed", upsName)
 				continue
 			}
 
@@ -1677,7 +1680,7 @@ func mergeAlternativeBackends(ing *ingress.Ingress, upstreams map[string]*ingres
 
 			server, ok := servers[host]
 			if !ok {
-				klog.Errorf("cannot merge alternative backend %s into hostname %s that does not exist",
+				klog.Errorf("cannot merge alternative backend %q into hostname %q that does not exist",
 					altUps.Name,
 					host)
 
@@ -1688,18 +1691,18 @@ func mergeAlternativeBackends(ing *ingress.Ingress, upstreams map[string]*ingres
 			for _, loc := range server.Locations {
 				priUps, ok := upstreams[loc.Backend]
 				if !ok {
-					klog.Warningf("cannot find primary backend %s for location %s%s", loc.Backend, server.Hostname, loc.Path)
+					klog.Warningf("cannot find primary backend %q for location %q", loc.Backend, server.Hostname+loc.Path)
 					continue
 				}
 				altEqualsPri = altUps.Name == priUps.Name
 				if altEqualsPri {
-					klog.Warningf("alternative upstream %s in Ingress %s/%s is primary upstream in Other Ingress for location %s%s!",
-						altUps.Name, ing.Namespace, ing.Name, server.Hostname, loc.Path)
+					klog.Warningf("alternative upstream %q in Ingress %q is primary upstream in Other Ingress for location %q!",
+						altUps.Name, k8s.MetaNamespaceKey(ing), server.Hostname+loc.Path)
 					break
 				}
 
 				if canMergeBackend(priUps, altUps) && loc.Path == path.Path && *loc.PathType == *path.PathType {
-					klog.V(2).Infof("matching backend %v found for alternative backend %v",
+					klog.V(2).Infof("matching backend %q found for alternative backend %q",
 						priUps.Name, altUps.Name)
 
 					merged = mergeAlternativeBackend(ing, priUps, altUps)
@@ -1707,7 +1710,7 @@ func mergeAlternativeBackends(ing *ingress.Ingress, upstreams map[string]*ingres
 			}
 
 			if !altEqualsPri && !merged {
-				klog.Warningf("unable to find real backend for alternative backend %v. Deleting.", altUps.Name)
+				klog.Warningf("unable to find real backend for alternative backend %q. Deleting.", altUps.Name)
 				delete(upstreams, altUps.Name)
 			}
 		}
@@ -1771,9 +1774,11 @@ func shouldCreateUpstreamForLocationDefaultBackend(upstream *ingress.Backend, lo
 }
 
 func externalNamePorts(name string, svc *apiv1.Service) *apiv1.ServicePort {
-	port, err := strconv.Atoi(name) // #nosec
-	if err != nil {
-		// not a number. check port names.
+	// A number outside 1-65535 is not looked up as a port name: it gives
+	// port 0, as a name that matches no port does.
+	port, isPortNumber, _ := ing_net.ParsePort(name)
+	if !isPortNumber {
+		// not a port number. check port names.
 		for _, svcPort := range svc.Spec.Ports {
 			if svcPort.Name != name {
 				continue
@@ -1793,14 +1798,8 @@ func externalNamePorts(name string, svc *apiv1.Service) *apiv1.ServicePort {
 	}
 
 	for _, svcPort := range svc.Spec.Ports {
-		//nolint:gosec // Ignore G109 error
-		if svcPort.Port != int32(port) {
+		if svcPort.Port != port {
 			continue
-		}
-
-		tp := svcPort.TargetPort
-		if tp.IntValue() == 0 {
-			tp = intstr.FromInt(port)
 		}
 
 		return &apiv1.ServicePort{
@@ -1812,10 +1811,9 @@ func externalNamePorts(name string, svc *apiv1.Service) *apiv1.ServicePort {
 
 	// ExternalName without port
 	return &apiv1.ServicePort{
-		Protocol: "TCP",
-		//nolint:gosec // Ignore G109 error
-		Port:       int32(port),
-		TargetPort: intstr.FromInt(port),
+		Protocol:   "TCP",
+		Port:       port,
+		TargetPort: intstr.FromInt32(port),
 	}
 }
 

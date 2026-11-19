@@ -7,6 +7,13 @@ name: Controller Image (UBC)
 # Mirrors upstream's `make release` flow (see cloudbuild.yaml) which runs the
 # Go cross-compile inside the golang build container, then uses buildx to
 # assemble and push multi-arch images.
+#
+# The controller image is FROM the nginx base image. NGINX_BASE points at
+# upstream's prebuilt base, which does NOT carry this fork's
+# images/nginx/rootfs/patches/ stack (the nginx source CVE backports), so the
+# base is compiled from source here and passed to `make release` as BASE_IMAGE.
+# Each architecture's base is built on a native runner: compiling nginx and its
+# modules for arm64 under QEMU took ~96 min, versus minutes natively.
 
 on:
   push:
@@ -33,9 +40,13 @@ env:
   PLATFORMS: amd64 arm64
 
 jobs:
-  release:
-    name: Build & Push
+  resolve:
+    name: Resolve ref and tags
     runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.resolve.outputs.ref }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      base_tag: ${{ steps.base_tag.outputs.base_tag }}
     steps:
       - name: Resolve ref and image tag
         id: resolve
@@ -58,10 +69,140 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.resolve.outputs.ref }}
+
+      - name: Read nginx base TAG
+        id: base_tag
+        run: echo "base_tag=$(cat images/nginx/TAG)" >> "$GITHUB_OUTPUT"
+
+  # Build the patched nginx base once per architecture, each on a native runner,
+  # and push it by digest. The base-manifest job joins the digests into one
+  # multi-arch tag.
+  base:
+    name: nginx base (${{ matrix.arch }})
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: latest
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Same build as images/nginx/Makefile (`docker buildx build rootfs`), for a
+      # single platform, pushed untagged so the manifest job can combine them.
+      - name: Build and push patched nginx base (${{ matrix.platform }})
+        id: build
+        run: |
+          docker buildx build images/nginx/rootfs \
+            --platform "${{ matrix.platform }}" \
+            --output "type=image,name=${REGISTRY}/nginx,push-by-digest=true,name-canonical=true,push=true" \
+            --metadata-file /tmp/metadata.json
+          DIGEST="$(jq -r '."containerimage.digest"' /tmp/metadata.json)"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+          echo "Built ${{ matrix.platform }} base: ${REGISTRY}/nginx@${DIGEST}"
+
+      # Fail the release if the base lacks the patch stack. `max_headers` is an
+      # nginx directive that exists only with patch 37 (CVE-2026-49975): a
+      # patched nginx prints "syntax is ok"; an unpatched one rejects it with
+      # "unknown directive". Runs natively on each architecture, and requires the
+      # positive result so that a container that fails to start also fails here.
+      - name: Verify the base carries the patch stack (${{ matrix.platform }})
+        run: |
+          OUT="$(docker run --rm "${REGISTRY}/nginx@${{ steps.build.outputs.digest }}" \
+            sh -c 'printf "events{}\nhttp{ max_headers 10; }\n" > /tmp/t.conf; nginx -c /tmp/t.conf -t 2>&1' || true)"
+          echo "$OUT"
+          if ! echo "$OUT" | grep -q 'syntax is ok'; then
+            echo "::error::nginx base image (${{ matrix.platform }}) is UNPATCHED or did not run: max_headers was not accepted."
+            exit 1
+          fi
+          echo "Base image (${{ matrix.platform }}) carries the patch stack (max_headers recognized)."
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  base-manifest:
+    name: nginx base (multi-arch manifest)
+    needs: [resolve, base]
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.manifest.outputs.image }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: base-digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: latest
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push the multi-arch base tag
+        id: manifest
+        env:
+          BASE_TAG: ${{ needs.resolve.outputs.base_tag }}
+        working-directory: /tmp/digests
+        run: |
+          BASE_REPO="${REGISTRY}/nginx"
+          refs=()
+          for d in *; do refs+=("${BASE_REPO}@sha256:${d}"); done
+          [ "${#refs[@]}" -eq 2 ] || { echo "::error::expected 2 per-arch digests, got ${#refs[@]}"; exit 1; }
+          docker buildx imagetools create -t "${BASE_REPO}:${BASE_TAG}" "${refs[@]}"
+          DIGEST="$(docker buildx imagetools inspect "${BASE_REPO}:${BASE_TAG}" --format '{{.Manifest.Digest}}')"
+          docker buildx imagetools inspect "${BASE_REPO}:${BASE_TAG}"
+          echo "image=${BASE_REPO}:${BASE_TAG}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Built patched nginx base: ${BASE_REPO}:${BASE_TAG}@${DIGEST}"
+
+  release:
+    name: Build & Push
+    needs: [resolve, base-manifest]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
           fetch-depth: 0
 
       - name: Override TAG file with image tag
-        run: echo -n "${{ steps.resolve.outputs.tag }}" > TAG
+        run: echo -n "${{ needs.resolve.outputs.tag }}" > TAG
 
       - name: Get Go version
         id: go
@@ -73,6 +214,8 @@ jobs:
           go-version: ${{ steps.go.outputs.version }}
           check-latest: true
 
+      # The controller Dockerfile still has a few RUN steps for arm64; they are
+      # cheap under QEMU (the Go binaries are cross-compiled natively).
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -88,44 +231,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # The controller image is FROM the nginx base image. NGINX_BASE points at
-      # upstream's prebuilt base, which does NOT carry this fork's
-      # images/nginx/rootfs/patches/ stack (the nginx source CVE backports). We
-      # must build the base from source here and pass it to `make release` as
-      # BASE_IMAGE, or the shipped controller runs unpatched nginx.
-      - name: Build and push patched nginx base
-        id: base
-        env:
-          # images/nginx/Makefile: IMAGE=$(REGISTRY)/nginx, TAG=$(cat TAG)
-          REGISTRY: ${{ env.REGISTRY }}
-          PLATFORMS: ${{ env.BUILDX_PLATFORMS }}
-        run: |
-          BASE_TAG="$(cat images/nginx/TAG)"
-          make -C images/nginx push REGISTRY="${REGISTRY}" PLATFORMS="${PLATFORMS}"
-          BASE_REPO="${REGISTRY}/nginx"
-          DIGEST="$(docker buildx imagetools inspect "${BASE_REPO}:${BASE_TAG}" --format '{{.Manifest.Digest}}')"
-          echo "image=${BASE_REPO}:${BASE_TAG}@${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "Built patched nginx base: ${BASE_REPO}:${BASE_TAG}@${DIGEST}"
-
-      # Fail the release if the base somehow lacks the patch stack. `max_headers`
-      # is an nginx directive that exists only with patch 37 (CVE-2026-49975),
-      # so an unpatched base rejects it with "unknown directive".
-      - name: Verify the base carries the patch stack
-        run: |
-          OUT="$(docker run --rm --platform linux/amd64 "${{ steps.base.outputs.image }}" \
-            sh -c 'printf "events{}\nhttp{ max_headers 10; }\n" > /tmp/t.conf; nginx -c /tmp/t.conf -t 2>&1' || true)"
-          echo "$OUT"
-          if echo "$OUT" | grep -q 'unknown directive "max_headers"'; then
-            echo "::error::nginx base image is UNPATCHED (max_headers missing) — the patch stack did not build into it."
-            exit 1
-          fi
-          echo "Base image carries the patch stack (max_headers recognized)."
-
       - name: Build and push controller images
         env:
           REGISTRY: ${{ env.REGISTRY }}
-          TAG: ${{ steps.resolve.outputs.tag }}
-          BASE_IMAGE: ${{ steps.base.outputs.image }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          BASE_IMAGE: ${{ needs.base-manifest.outputs.image }}
           BUILDX_PLATFORMS: ${{ env.BUILDX_PLATFORMS }}
           PLATFORMS: ${{ env.PLATFORMS }}
           COMMIT_SHA: ${{ github.sha }}
@@ -139,7 +249,8 @@ jobs:
             echo "## Pushed images"
             echo ""
             echo '```'
-            echo "${REGISTRY}/controller:${{ steps.resolve.outputs.tag }}"
-            echo "${REGISTRY}/controller-chroot:${{ steps.resolve.outputs.tag }}"
+            echo "${REGISTRY}/controller:${{ needs.resolve.outputs.tag }}"
+            echo "${REGISTRY}/controller-chroot:${{ needs.resolve.outputs.tag }}"
+            echo "base: ${{ needs.base-manifest.outputs.image }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

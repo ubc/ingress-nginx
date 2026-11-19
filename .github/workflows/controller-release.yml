@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: '0 0 * * 1' # every Monday at 00:00 UTC
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'Release even if nothing that ships changed since the last release'
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Only report whether a release is needed and its tag; create nothing'
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -52,6 +61,7 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ inputs.force }}
         run: |
           git fetch --tags
           TAG=$(git tag --points-at HEAD)
@@ -61,18 +71,22 @@ jobs:
             # Get the last release tag (controller-v* pattern)
             LAST_TAG=$(git tag --list 'controller-v*' --sort=-v:refname | head -1)
 
-            if [ -n "$LAST_TAG" ]; then
+            if [ "$FORCE" == "true" ]; then
+              echo "Release forced with the force input."
+              echo "need_release=yes" >> $GITHUB_OUTPUT
+            elif [ -n "$LAST_TAG" ]; then
               echo "Last release tag: $LAST_TAG"
 
               # Get all changed files since last tag
               CHANGED_FILES=$(git diff --name-only "$LAST_TAG"..HEAD)
 
               # Only release if something that ends up in the shipped image
-              # changed: Go code, the go.mod/go.sum of the shipped modules, the
-              # nginx patch stack (compiled into the base by controller-image.yml),
-              # the controller's /etc/nginx files and the custom error pages.
-              # build.sh and images/nginx/TAG only matter via the patches, so
-              # they are not listed; use workflow_dispatch to force those.
+              # changed: Go code, the go.mod/go.sum of the shipped modules (root,
+              # kube-webhook-certgen and custom-error-pages), the nginx patch stack
+              # (compiled into the base by controller-image.yml), the controller's
+              # /etc/nginx files and the custom error pages. build.sh and
+              # images/nginx/TAG only matter via the patches, so they are not
+              # listed; use the force input to release a change to them.
               SHIPPED_PATHS='\.go$|^go\.(mod|sum)$|^images/(kube-webhook-certgen|custom-error-pages)/rootfs/go\.(mod|sum)$|^images/nginx/rootfs/patches/|^rootfs/etc/nginx/|^images/custom-error-pages/rootfs/(www|etc)/'
               RELEASE_WORTHY_CHANGES=$(echo "$CHANGED_FILES" | grep -E "$SHIPPED_PATHS" || true)
 
@@ -126,8 +140,15 @@ jobs:
           echo "Bumping version: controller-v${VERSION} -> ${NEW_TAG}"
           echo "tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
 
+      - name: Report what a dry run would release
+        if: steps.check.outputs.need_release == 'yes' && inputs.dry_run == true
+        env:
+          NEW_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          echo "Dry run: would create release $NEW_TAG at $(git rev-parse HEAD). Nothing was created."
+
       - name: Create GitHub release
-        if: steps.check.outputs.need_release == 'yes'
+        if: steps.check.outputs.need_release == 'yes' && inputs.dry_run != true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -136,7 +157,7 @@ jobs:
             --generate-notes
 
       - name: Trigger controller image build
-        if: steps.check.outputs.need_release == 'yes'
+        if: steps.check.outputs.need_release == 'yes' && inputs.dry_run != true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

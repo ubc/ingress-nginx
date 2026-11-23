@@ -82,12 +82,13 @@ jobs:
 
               # Only release if something that ends up in the shipped image
               # changed: Go code, the go.mod/go.sum of the shipped modules (root,
-              # kube-webhook-certgen and custom-error-pages), the nginx patch stack
-              # (compiled into the base by controller-image.yml), the controller's
-              # /etc/nginx files and the custom error pages. build.sh and
-              # images/nginx/TAG only matter via the patches, so they are not
-              # listed; use the force input to release a change to them.
-              SHIPPED_PATHS='\.go$|^go\.(mod|sum)$|^images/(kube-webhook-certgen|custom-error-pages)/rootfs/go\.(mod|sum)$|^images/nginx/rootfs/patches/|^rootfs/etc/nginx/|^images/custom-error-pages/rootfs/(www|etc)/'
+              # kube-webhook-certgen and custom-error-pages), the Go toolchain
+              # (GOLANG_VERSION; it is compiled into every shipped binary), the
+              # nginx patch stack (compiled into the base by controller-image.yml),
+              # the controller's /etc/nginx files and the custom error pages.
+              # build.sh and images/nginx/TAG only matter via the patches, so they
+              # are not listed; use the force input to release a change to them.
+              SHIPPED_PATHS='\.go$|^go\.(mod|sum)$|^GOLANG_VERSION$|^images/(kube-webhook-certgen|custom-error-pages)/rootfs/go\.(mod|sum)$|^images/nginx/rootfs/patches/|^rootfs/etc/nginx/|^images/custom-error-pages/rootfs/(www|etc)/'
               RELEASE_WORTHY_CHANGES=$(echo "$CHANGED_FILES" | grep -E "$SHIPPED_PATHS" || true)
 
               if [ -z "$RELEASE_WORTHY_CHANGES" ]; then
